@@ -1,0 +1,93 @@
+#!/usr/bin/python
+#
+# munkisparkle.py
+# Uses Sparkle update framework data to create Manifest files,
+# download applications and updates 
+# 
+# usage: munkisparkle /path/to/applicationbundle
+# 
+
+import os
+import sys
+import optparse
+import subprocess
+import urllib
+from xml.dom import minidom
+
+from munkilib import munkicommon
+from munkilib import FoundationPlist
+
+
+def getsparkleinfo(apppath):
+    """
+    If available, gets sparkle info from the application
+    returns a dictionary of the info that was found
+    if no sparkle info is found, dies. 
+    """
+    sparkledict = {}
+
+    infopath = os.path.join(apppath, "Contents", "Info.plist")
+    plist = FoundationPlist.readPlist(infopath)
+
+    if 'SUFeedURL' in plist:
+        sparkledict['url'] = plist['SUFeedURL']
+        if 'SUPublicDSAKeyFile' in plist:
+            sparkledict['keyfile'] = plist['SUPublicDSAKeyFile']
+        else:   
+            print >> sys.stderr, ("app: '%s' uses Sparkle but is not DSA signing updates" % apppath);
+    else:
+        print >> sys.stderr, ("app: '%s' does not appear to be using Sparkle for updates" % apppath)
+
+    return sparkledict
+
+def fetchsparklefeed(url):
+    """ 
+    Fetches the Sparkle RSS feed from the web, parses it
+    """
+    sparklefeeddict = {}
+
+    # grab the feed and parse it
+    sparklefeed = urllib.urlopen(url).read()
+    xmlfeed = minidom.parseString(sparklefeed).documentElement
+
+    # assume that most recent update is the first one
+    most_recent = xmlfeed.getElementsByTagName("enclosure")[0]
+
+    sparklefeeddict['version'] = most_recent.getAttribute('sparkle:version')
+    sparklefeeddict['url'] = most_recent.getAttribute('url')
+    
+    return sparklefeeddict
+
+
+def checksparklekey(keypath,filepath):
+    """ checks the DSA key on the downloaded file to verify it's contents """
+    return True # FIXME - this currently is nulled out
+
+
+def main():
+    """ main function """
+
+    usage = """usage: %prog [options] application ... """
+    optparser = optparse.OptionParser(usage)
+
+    (opts, args) = optparser.parse_args()
+
+    if len(args) == 0:
+        optparser.print_usage()
+        exit(-1)
+    
+    for arg in args:
+        if munkicommon.isApplication(arg):
+            sparkle = getsparkleinfo(arg)
+            if 'url' in sparkle:
+                print "app: %s -> url: %s" % (arg, sparkle['url'])
+                feed = fetchsparklefeed(sparkle['url'])
+                if 'url' in feed:
+                    print " version: %s at %s" % (feed['version'],feed['url'])
+        else:
+            print  >> sys.stderr, ("'%s' is not an application" % arg)
+   
+
+if __name__ == '__main__':
+    main()
+
