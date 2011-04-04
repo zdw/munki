@@ -1,0 +1,166 @@
+#!/usr/bin/python
+#
+# munkiappcast.py
+# Uses appcast data (via appcast) to download updates, then
+# creates appropriate Manifest files. 
+# 
+
+import sys
+import os
+import optparse
+import subprocess
+import tempfile
+import urllib # for downloading appcasts
+from xml.dom import minidom # to parse appcasts
+
+from munkilib import munkicommon
+from munkilib import FoundationPlist
+
+def getAppcastInfo(path):
+    """
+    If available, gets appcast info from the application
+    returns a dictionary of the info that was found
+    if no appcast info is found, dies. 
+    """
+    appcastdict = {}
+
+    if not munkicommon.isApplication(path):
+        print  >> sys.stderr, ("'%s' is not an application" % path)
+        exit(-1)
+    else:
+        infopath = os.path.join(path, "Contents", "Info.plist")
+        plist = FoundationPlist.readPlist(infopath)
+
+        if not 'SUFeedURL' in plist:
+            print >> sys.stderr, \
+                ("app: '%s' does not appear to be using appcast for updates" % path)
+            exit(-1)
+        else:
+            appcastdict['url'] = plist['SUFeedURL']
+            if 'SUPublicDSAKeyFile' in plist:
+                appcastdict['keyfile'] = os.path.join(path, "Contents", "Resources", plist['SUPublicDSAKeyFile'])
+            else:   
+                print >> sys.stderr,  \
+                    ("app: '%s' uses appcast but is not DSA signing updates" % apppath);
+
+    return appcastdict
+
+
+def fetchAppcastFeed(url):
+    """ 
+    Fetches the appcast RSS feed from the web, parses it, 
+    returns information on the topmost update
+    """
+    appcastfeeddict = {}
+
+    # grab the feed and parse it
+    appcastfeed = urllib.urlopen(url).read()
+    xmlfeed = minidom.parseString(appcastfeed).documentElement
+
+    # assume that most recent update is the first one
+    most_recent = xmlfeed.getElementsByTagName("item")[0]
+
+    enclosure = most_recent.getElementsByTagName("enclosure")[0]
+
+    appcastfeeddict['version'] = enclosure.getAttribute('sparkle:version')
+
+    appcastfeeddict['enclosure_url'] = enclosure.getAttribute('url')
+    
+    if enclosure.hasAttribute('sparkle:dsaSignature'):
+        appcastfeeddict['dsasig'] = enclosure.getAttribute('sparkle:dsaSignature');
+
+    if enclosure.hasAttribute('sparkle:shortVersionString'):
+         appcastfeeddict['shortversion'] = \
+                 enclosure.getAttribute('sparkle:shortVersionString');
+
+    return appcastfeeddict
+
+
+def fetchAppcastFileEnclosure(url):
+    """
+    fetches the file specified at the URL, returns a path to the file
+    """
+
+    (filename, headers) = urllib.urlretrieve(url)
+
+    return filename
+
+
+def checkDSAKey(signature, keypath, filepath):
+    """ checks the DSA key on the downloaded file to verify it's contents """
+
+    # this is the reverse of how the signature is generated, as specified here:
+    # https://github.com/andymatuschak/Sparkle/blob/master/sign_update.rb
+
+    openssl = '/usr/bin/openssl'
+
+    # OpenSSL only will process input if it ends with a newline
+    sig_openssl = "%s\n" % signature 
+
+    # get a temp file for storing the binary version of the hash
+    bin_sig_file = tempfile.NamedTemporaryFile().name
+
+    # equivalent shell command (using MarsEdit 3.2 as a test)
+    # echo "MCwCFH0m2lXraXE36vqcx+JxrovmDV/EAhQ2+v25wj++PSJWRn/5DQtkqKDPpg==" | openssl enc -d -base64 -out sha1.bin
+
+    base64_to_bin_cmd = [ openssl, 'enc', '-d', '-base64',  '-out', bin_sig_file ]
+    
+    proc_b64tobin = subprocess.Popen(base64_to_bin_cmd, stdin=subprocess.PIPE)
+    proc_b64tobin.communicate(input=sig_openssl)
+
+    # openssl dgst -sha1 -binary  MarsEdit3.2.zip | openssl dgst -dss1 -verify RedSweaterUpdatesPublicKey.pem -signature sha1.bin 
+    # correct return: Verified OK
+
+    dgst1_cmd = [ openssl, 'dgst', '-sha1', '-binary', filepath ]
+    dgst2_cmd = [ openssl, 'dgst', '-dss1', '-verify', keypath, '-signature', bin_sig_file]
+    
+    proc_dgst1 = subprocess.Popen(dgst1_cmd, stdout=subprocess.PIPE)
+    proc_dgst2 = subprocess.Popen(dgst2_cmd, stdin=proc_dgst1.stdout, stdout=subprocess.PIPE)
+    proc_dgst1.stdout.close()
+    verify_out = proc_dgst2.communicate()[0]
+
+    print " DSA signature check: %s" % verify_out
+
+    if verify_out == "Verified OK":
+        return True
+    return False
+
+
+def main():
+    """ main function """
+
+    usage = """usage: %prog [options] [/path/to/application]
+        Creates or maintains a repository of appcasts for use with munki"""
+
+    p = optparse.OptionParser(usage)
+
+    p.add_option('-a', '--app',
+            action='store', 
+            type='string',
+            dest='appname',
+            help="""Add the appcast of the application to the repo""")
+
+    p.add_option('-u', '--update', 
+            action='store_true',
+            help="""Search for updates for all appcasts, if found, download updates""")
+
+    (opts, args) = p.parse_args()
+
+    if opts.appname:
+        
+        appcast = getAppcastInfo(opts.appname)
+        print "app: %s -> url: %s" % (opts.appname, appcast['url'])
+        
+        feed = fetchAppcastFeed(appcast['url'])
+        print " version: %s at %s" % (feed['version'], feed['enclosure_url'])
+
+        enclosure = fetchAppcastFileEnclosure(feed['enclosure_url'])
+        print " fetched file: %s" % enclosure
+  
+        if 'enclosure' and feed['dsasig']:
+            dsavalid = checkDSAKey(feed['dsasig'], appcast['keyfile'], enclosure)
+
+
+if __name__ == '__main__':
+    main()
+
