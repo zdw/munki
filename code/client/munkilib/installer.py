@@ -20,12 +20,16 @@ munki module to automatically install pkgs, mpkgs, and dmgs
 (containing pkgs and mpkgs) from a defined folder.
 """
 
+import datetime
 import os
+import signal
 import subprocess
+import time
 
 import adobeutils
 import munkicommon
 import munkistatus
+import updatecheck
 import FoundationPlist
 from removepackages import removepackages
 
@@ -35,6 +39,7 @@ from removepackages import removepackages
 # calls installWithInfo()
 munkicommon.report['InstallResults'] = []
 munkicommon.report['RemovalResults'] = []
+
 
 def removeBundleRelocationInfo(pkgpath):
     '''Attempts to remove any info in the package
@@ -129,12 +134,29 @@ def install(pkgpath, choicesXMLpath=None, suppressBundleRelocation=False):
                                   '-target', '/']
     if choicesXMLpath:
         cmd.extend(['-applyChoiceChangesXML', choicesXMLpath])
-    proc = subprocess.Popen(cmd, shell=False, bufsize=-1,
+
+    # run installer, setting the program id of the process (all child
+    # processes will also use the same program id), making it easier to kill
+    # not only hung installer but also any child processes it started.
+    proc = munkicommon.Popen(cmd, shell=False, bufsize=-1,
                             stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            preexec_fn=lambda: os.setpgid(
+                                os.getpid(), os.getpid()))
+    timeout = 2 * 60 * 60
 
     while True:
-        installinfo = proc.stdout.readline().decode('UTF-8')
+        try:
+            installinfo = proc.timed_readline(proc.stdout, timeout=timeout)
+        except munkicommon.TimeoutError:
+            munkicommon.display_error(
+                "/usr/sbin/installer timeout after %d seconds" % timeout)
+            signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # reap immed.
+            os.kill(-1 * proc.pid, signal.SIGTERM)
+            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+            break
+
+        installinfo = installinfo.decode('UTF-8')
         if not installinfo and (proc.poll() != None):
             break
         if installinfo.startswith("installer:"):
@@ -171,15 +193,24 @@ def install(pkgpath, choicesXMLpath=None, suppressBundleRelocation=False):
             else:
                 munkicommon.log(msg)
 
+    # try for a little bit to catch return code from exiting process...
     retcode = proc.poll()
-    if retcode:
-        munkicommon.display_status("Install of %s failed." % packagename)
+    t = 0
+    while retcode is None and t < 5:
+        time.sleep(1)
+        t += 1
+        retcode = proc.poll()
+
+    if retcode != 0:  # this could be <0, >0, or even None (never returned)
+        munkicommon.display_status(
+                "Install of %s failed with return code %s" % (
+                    packagename, retcode))
         munkicommon.display_error("-"*78)
         for line in installeroutput:
             munkicommon.display_error(line.rstrip("\n"))
         munkicommon.display_error("-"*78)
         restartneeded = False
-    else:
+    elif retcode == 0:
         munkicommon.log("Install of %s was successful." % packagename)
         if munkicommon.munkistatusoutput:
             munkistatus.percent(100)
@@ -455,7 +486,53 @@ def removeCopiedItems(itemlist):
 
     return retcode
 
-def installWithInfo(dirpath, installlist, only_forced=False, applesus=False):
+
+def itemPrereqsInSkippedItems(item, skipped_items):
+    '''Looks for item prerequisites (requires and update_for) in the list
+    of skipped items. Returns a list of matches.'''
+    munkicommon.display_debug1(
+        'Checking for skipped prerequisites for %s-%s'
+        % (item['name'], item.get('version_to_install')))
+
+    # get list of prerequisites for this item
+    prerequisites = item.get('requires', [])
+    prerequisites.extend(item.get('update_for', []))
+    if not prerequisites:
+        munkicommon.display_debug1(
+            '%s-%s has no prerequisites.'
+            % (item['name'], item.get('version_to_install')))
+        return []
+    munkicommon.display_debug1('Prerequisites: %s' % ", ".join(prerequisites))
+
+    # build a dictionary of names and versions of skipped items
+    skipped_item_dict = {}
+    for skipped_item in skipped_items:
+        if skipped_item['name'] not in skipped_item_dict:
+            skipped_item_dict[skipped_item['name']] = []
+        normalized_version = updatecheck.trimVersionString(
+                                skipped_item.get('version_to_install', '0.0'))
+        munkicommon.display_debug1('Adding skipped item: %s-%s'
+                                % (skipped_item['name'], normalized_version))
+        skipped_item_dict[skipped_item['name']].append(normalized_version)
+
+    # now check prereqs against the skipped items
+    matched_prereqs = []
+    for prereq in prerequisites:
+        (name, version) = updatecheck.nameAndVersion(prereq)
+        munkicommon.display_debug1(
+            'Comparing %s-%s against skipped items' % (name, version))
+        if name in skipped_item_dict:
+            if version:
+                version = updatecheck.trimVersionString(version)
+                if version in skipped_item_dict[name]:
+                    matched_prereqs.append(prereq)
+            else:
+                matched_prereqs.append(prereq)
+    return matched_prereqs
+
+
+def installWithInfo(
+    dirpath, installlist, only_unattended=False, applesus=False):
     """
     Uses the installlist to install items in the
     correct order.
@@ -465,25 +542,38 @@ def installWithInfo(dirpath, installlist, only_forced=False, applesus=False):
     skipped_installs = []
     for item in installlist:
         itemindex = itemindex + 1
-        if only_forced:
-            if not item.get('forced_install'):
+        if only_unattended:
+            if not item.get('unattended_install'):
                 skipped_installs.append(item)
                 munkicommon.display_detail(
-                    ('Skipping install of %s because it\'s not flagged for '
-                    'forced_install') % item['name'])
+                    ('Skipping install of %s because it\'s not unattended.'
+                     % item['name']))
                 continue
             elif blockingApplicationsRunning(item):
                 skipped_installs.append(item)
                 munkicommon.display_detail(
-                    "Skipping forced install of %s" % item['name'])
+                    'Skipping unattended install of %s because '
+                    'blocking application(s) running.'
+                    % item['name'])
                 continue
+            skipped_prereqs = itemPrereqsInSkippedItems(
+                                                    item, skipped_installs)
+            if skipped_prereqs:
+                # need to skip this too
+                skipped_installs.append(item)
+                munkicommon.display_detail(
+                    'Skipping unattended install of %s because these '
+                    'prerequisites were skipped: %s'
+                    % (item['name'], ", ".join(skipped_prereqs)))
+                continue
+
         if munkicommon.stopRequested():
             return restartflag, skipped_installs
-        
+
         retcode = 0
         if 'preinstall_script' in item:
             retcode = runEmbeddedScript('preinstall_script', item)
-            
+
         if retcode == 0 and 'installer_item' in item:
             display_name = item.get('display_name') or item.get('name')
             version_to_install = item.get('version_to_install','')
@@ -491,7 +581,7 @@ def installWithInfo(dirpath, installlist, only_forced=False, applesus=False):
                 munkistatus.message("Installing %s (%s of %s)..." %
                                     (display_name, itemindex,
                                      len(installlist)))
-                munkistatus.detail("")
+                munkistatus.detail('')
                 munkistatus.percent(-1)
             else:
                 munkicommon.display_status("Installing %s (%s of %s)" %
@@ -504,7 +594,7 @@ def installWithInfo(dirpath, installlist, only_forced=False, applesus=False):
                 munkicommon.display_error("Installer item %s was not found." %
                                            item["installer_item"])
                 return restartflag, skipped_installs
-                
+
             installer_type = item.get("installer_type","")
             if installer_type.startswith("Adobe"):
                 retcode = adobeutils.doAdobeInstall(item)
@@ -595,7 +685,7 @@ def installWithInfo(dirpath, installlist, only_forced=False, applesus=False):
                                     suppressBundleRelocation)
                         if needtorestart:
                             restartflag = True
-                            
+
             if retcode == 0  and 'postinstall_script' in item:
                 # only run embedded postinstall script if the install did not
                 # return a failure code
@@ -701,7 +791,7 @@ def writefile(stringdata, path):
 def runEmbeddedScript(scriptname, pkginfo_item):
     '''Runs a script embedded in the pkginfo.
     Returns the result code.'''
-    
+
     # get the script text from the pkginfo
     script_text = pkginfo_item.get(scriptname)
     itemname =  pkginfo_item.get('name')
@@ -709,7 +799,7 @@ def runEmbeddedScript(scriptname, pkginfo_item):
         munkicommon.display_error(
             'Missing script %s for %s' % (scriptname, itemname))
         return -1
-        
+
     # write the script to a temp file
     scriptpath = os.path.join(munkicommon.tmpdir, scriptname)
     if writefile(script_text, scriptpath):
@@ -717,18 +807,18 @@ def runEmbeddedScript(scriptname, pkginfo_item):
         retcode = subprocess.call(cmd)
         if retcode:
             munkicommon.display_error(
-                'Error setting script mode in %s for %s' 
+                'Error setting script mode in %s for %s'
                 % (scriptname, itemname))
             return -1
     else:
         munkicommon.display_error(
             'Cannot write script %s for %s' % (scriptname, itemname))
         return -1
-    
+
     # now run the script
     return runScript(itemname, scriptpath, scriptname)
-    
-    
+
+
 def runScript(itemname, path, scriptname):
     '''Runs a script, Returns return code.'''
     if munkicommon.munkistatusoutput:
@@ -771,24 +861,57 @@ def runScript(itemname, path, scriptname):
     return retcode
 
 
-def processRemovals(removallist, only_forced=False):
+def skippedItemsThatRequireThisItem(item, skipped_items):
+    '''Looks for items in the skipped_items that require or are update_for
+    the current item. Returns a list of matches.'''
+    munkicommon.display_debug1(
+        'Checking for skipped items that require %s' % item['name'])
+
+    matched_skipped_items = []
+    for skipped_item in skipped_items:
+        # get list of prerequisites for this skipped_item
+        prerequisites = skipped_item.get('requires', [])
+        prerequisites.extend(skipped_item.get('update_for', []))
+        munkicommon.display_debug1(
+            '%s has these prerequisites: %s'
+            % (skipped_item['name'], ', '.join(prerequisites)))
+        for prereq in prerequisites:
+            (prereq_name, unused_version) = updatecheck.nameAndVersion(prereq)
+            if prereq_name == item['name']:
+                matched_skipped_items.append(skipped_item['name'])
+    return matched_skipped_items
+
+
+def processRemovals(removallist, only_unattended=False):
     '''processes removals from the removal list'''
     restartFlag = False
     index = 0
     skipped_removals = []
     for item in removallist:
-        if only_forced:
-            if not item.get('forced_uninstall'):
+        if only_unattended:
+            if not item.get('unattended_uninstall'):
                 skipped_removals.append(item)
                 munkicommon.display_detail(
-                    ('Skipping removal of %s because it\'s not flagged for '
-                    'forced_uninstall') % item['name'])
+                    ('Skipping removal of %s because it\'s not unattended.'
+                     % item['name']))
                 continue
             elif blockingApplicationsRunning(item):
                 skipped_removals.append(item)
                 munkicommon.display_detail(
-                    'Skipping forced removal of %s ' % item['name'])
+                    'Skipping unattended removal of %s because '
+                    'blocking application(s) running.' % item['name'])
                 continue
+            dependent_skipped_items = skippedItemsThatRequireThisItem(
+                                                    item, skipped_removals)
+            if dependent_skipped_items:
+                # need to skip this too
+                skipped_removals.append(item)
+                munkicommon.display_detail(
+                    'Skipping unattended removal of %s because these '
+                    'skipped items required it: %s'
+                    % (item['name'], ", ".join(dependent_skipped_items)))
+                continue
+
         if munkicommon.stopRequested():
             return restartFlag
         if not item.get('installed'):
@@ -936,19 +1059,19 @@ def blockingApplicationsRunning(pkginfoitem):
     return False
 
 
-def run(only_forced=False):
+def run(only_unattended=False):
     """Runs the install/removal session.
 
     Args:
-      only_forced: Boolean. If True, only do forced installs/removals.
+      only_unattended: Boolean. If True, only do unattended_(un)install pkgs.
     """
     managedinstallbase = munkicommon.pref('ManagedInstallDir')
     installdir = os.path.join(managedinstallbase , 'Cache')
 
     removals_need_restart = installs_need_restart = False
 
-    if only_forced:
-        munkicommon.log("### Beginning forced installer session ###")
+    if only_unattended:
+        munkicommon.log("### Beginning unattended installer session ###")
     else:
         munkicommon.log("### Beginning managed installer session ###")
 
@@ -989,8 +1112,8 @@ def run(only_forced=False):
                     munkistatus.percent(-1)
                 munkicommon.log("Processing removals")
                 (removals_need_restart,
-                 skipped_removals) = processRemovals(removallist,
-                                                     only_forced=only_forced)
+                 skipped_removals) = processRemovals(
+                     removallist, only_unattended=only_unattended)
                 # if any removals were skipped, record them for later
                 installinfo['removals'] = skipped_removals
 
@@ -1013,13 +1136,14 @@ def run(only_forced=False):
                         munkistatus.percent(-1)
                     munkicommon.log("Processing installs")
                     (installs_need_restart,
-                    skipped_installs) = installWithInfo(installdir,
-                                                        installlist,
-                                                    only_forced=only_forced)
+                    skipped_installs) = installWithInfo(
+                        installdir,
+                        installlist,
+                        only_unattended=only_unattended)
                     # if any installs were skipped record them for later
                     installinfo['managed_installs'] = skipped_installs
 
-        if (only_forced and
+        if (only_unattended and
             installinfo['managed_installs'] or installinfo['removals']):
             # need to write the installinfo back out minus the stuff we
             # actually installed
@@ -1031,11 +1155,11 @@ def run(only_forced=False):
                     "Could not write to %s" % installinfopath)
 
     else:
-        if not only_forced:  # no need to log that no forced found.
+        if not only_unattended:  # no need to log that no unattended pkgs found.
             munkicommon.log("No %s found." % installinfo)
 
-    if only_forced:
-        munkicommon.log("###    End forced installer session    ###")
+    if only_unattended:
+        munkicommon.log("###    End unattended installer session    ###")
     else:
         munkicommon.log("###    End managed installer session    ###")
 

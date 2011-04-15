@@ -21,6 +21,7 @@ managedsoftwareupdate
 import grp
 import optparse
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -37,8 +38,8 @@ except:
     scriptdir = os.path.realpath(os.path.dirname(sys.argv[0]))
     script = os.path.join(scriptdir, 'report_broken_client')
     try:
-        result, output = utils.runExternalScript(script)
-        print >> sys.stderr, result, output
+        result, stdout, stderr = utils.runExternalScript(script)
+        print >> sys.stderr, result, stdout, stderr
     except utils.ScriptNotFoundError:
         pass  # script is not required, so pass
     except utils.RunExternalScriptError, e:
@@ -57,15 +58,19 @@ from munkilib import utils
 def getIdleSeconds():
     """Returns the number of seconds since the last mouse 
     or keyboard event."""
-    cmd = ['/usr/sbin/ioreg', '-c', 'IOHIDSystem', '-d', '4']
+    cmd = ['/usr/sbin/ioreg', '-c', 'IOHIDSystem']
     proc = subprocess.Popen(cmd, shell=False, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     (output, unused_err) = proc.communicate()
     ioreglines = str(output).splitlines()
+    idle_time = 0
+    regex = re.compile('"?HIDIdleTime"?\s+=\s+(\d+)')
     for line in ioreglines:
-        if 'Idle' in line:
-            parts = line.split()
-            return int(int(parts[3])/1000000000)
+        idle_re = regex.search(line)
+        if idle_re:
+            idle_time = idle_re.group(1)
+            break
+    return int(int(idle_time)/1000000000)
 
 
 def networkUp():
@@ -135,16 +140,16 @@ def initMunkiDirs():
         return True
 
 
-def doInstallTasks(only_forced=False):
+def doInstallTasks(only_unattended=False):
     """Perform our installation/removal tasks.
 
     Args:
-      only_forced: Boolean. If True, only do forced installs/removals.
+      only_unattended: Boolean. If True, only do unattended_(un)install items.
 
     Returns:
       Boolean. True if a restart is required, False otherwise.
     """
-    if not only_forced:
+    if not only_unattended:
         # first, clear the last notified date
         # so we can get notified of new changes after this round
         # of installs
@@ -161,7 +166,7 @@ def doInstallTasks(only_forced=False):
     if munkiUpdatesAvailable():
         # install munki updates
         try:
-            need_to_restart = installer.run(only_forced=only_forced)
+            need_to_restart = installer.run(only_unattended=only_unattended)
         except:
             munkicommon.display_error(
                 'Unexpected error in munkilib.installer:')
@@ -171,11 +176,11 @@ def doInstallTasks(only_forced=False):
 
         # clear any Apple update info since it may no longer
         # be relevant
-        if not only_forced:
+        if not only_unattended:
             appleupdates.clearAppleUpdateInfo()
     elif ((munkicommon.pref('InstallAppleSoftwareUpdates') or
            munkicommon.pref('AppleSoftwareUpdatesOnly'))
-           and not only_forced):
+           and not only_unattended):
         # are we supposed to handle Apple Software Updates?
         try:
             need_to_restart = appleupdates.installAppleUpdates()
@@ -448,8 +453,9 @@ def main():
     if os.path.exists(preflightscript):
         munkicommon.display_status('Performing preflight tasks...')
     try:
-        result, output = utils.runExternalScript(preflightscript, runtype)
-        munkicommon.display_info(output)
+        result, stdout, stderr = utils.runExternalScript(
+            preflightscript, runtype)
+        munkicommon.display_info(stdout)
     except utils.ScriptNotFoundError:
         result = 0
         pass  # script is not required, so pass
@@ -462,6 +468,7 @@ def main():
         munkicommon.display_info(
             'managedsoftwareupdate run aborted by preflight script: %s' 
             % result)
+        munkicommon.display_info(stderr)
         # record the check result for use by Managed Software Update.app
         # right now, we'll return the same code as if the munki server
         # was unavailable. We need to revisit this and define additional
@@ -625,11 +632,11 @@ def main():
                     munkicommon.log('Skipping auto install because system is '
                                     'not idle (keyboard or mouse activity).')
             else:  # there are GUI users
-                doInstallTasks(only_forced=True)
+                doInstallTasks(only_unattended=True)
                 # it's possible that we no longer have any available updates
                 # so we need to check InstallInfo.plist again
-                # however Apple Updates have not been affected by the forced
-                # install tasks (so that check is still valid).
+                # however Apple Updates have not been affected by the
+                # unattended install tasks (so that check is still valid).
                 if appleupdatesavailable or munkiUpdatesAvailable():
                     consoleuser = munkicommon.getconsoleuser()
                     if consoleuser == u'loginwindow':
@@ -670,8 +677,11 @@ def main():
     # run the postflight script if it exists
     postflightscript = os.path.join(scriptdir, 'postflight')
     try:
-        unused_r, output = utils.runExternalScript(postflightscript, runtype)
-        munkicommon.display_info(output)
+        result, stdout, stderr = utils.runExternalScript(
+            postflightscript, runtype)
+        munkicommon.display_info(stdout)
+        if result:
+            munkicommon.display_info(stderr)
     except utils.ScriptNotFoundError:
         pass  # script is not required, so pass
     except utils.RunExternalScriptError, e:

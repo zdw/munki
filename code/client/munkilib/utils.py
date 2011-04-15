@@ -98,7 +98,7 @@ def runExternalScript(script, *args):
       script: string path to the script to execute.
       args: args to pass to the script.
     Returns:
-      Tuple. (integer exit status from script, str output).
+      Tuple. (integer exit status from script, str stdout, str stderr).
     Raises:
       ScriptNotFoundError: the script was not found at the given path.
       RunExternalScriptError: there was an error running the script.
@@ -121,8 +121,8 @@ def runExternalScript(script, *args):
                                 stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
-        (output, err) = proc.communicate()
-        return proc.returncode, output
+        (stdout, stderr) = proc.communicate()
+        return proc.returncode, stdout, stderr
     else:
         raise RunExternalScriptError('%s not executable' % script)
 
