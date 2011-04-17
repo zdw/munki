@@ -1,12 +1,14 @@
 #!/usr/bin/python
 #
 # munkiappcast.py
-# Uses appcast data (via appcast) to download updates, then
-# creates appropriate Manifest files. 
-# 
+# uses appcast (sparkle) data to build a repository of programs
+# that can be updated automatically
+#
 
 import sys
 import os
+import re
+import shutil
 import optparse
 import subprocess
 import tempfile
@@ -36,12 +38,17 @@ def getAppcastInfo(path):
                 ("app: '%s' does not appear to be using appcast for updates" % path)
             exit(-1)
         else:
+            appcastdict['name'] = plist['CFBundleName']
+            appcastdict['version'] = plist['CFBundleVersion']
+            appcastdict['shortversion'] = plist['CFBundleShortVersionString']
+
             appcastdict['url'] = plist['SUFeedURL']
             if 'SUPublicDSAKeyFile' in plist:
-                appcastdict['keyfile'] = os.path.join(path, "Contents", "Resources", plist['SUPublicDSAKeyFile'])
+                appcastdict['dsakey'] = os.path.join(path, "Contents", "Resources", plist['SUPublicDSAKeyFile'])
             else:   
                 print >> sys.stderr,  \
-                    ("app: '%s' uses appcast but is not DSA signing updates" % apppath);
+                    (" app: '%s' uses appcast but is not DSA signing updates" % apppath);
+                appcastdict['dsakey'] = ''
 
     return appcastdict
 
@@ -67,13 +74,43 @@ def fetchAppcastFeed(url):
     appcastfeeddict['enclosure_url'] = enclosure.getAttribute('url')
     
     if enclosure.hasAttribute('sparkle:dsaSignature'):
-        appcastfeeddict['dsasig'] = enclosure.getAttribute('sparkle:dsaSignature');
+        appcastfeeddict['dsasig'] = enclosure.getAttribute('sparkle:dsaSignature')
 
     if enclosure.hasAttribute('sparkle:shortVersionString'):
          appcastfeeddict['shortversion'] = \
-                 enclosure.getAttribute('sparkle:shortVersionString');
+                 enclosure.getAttribute('sparkle:shortVersionString')
+    else:
+        appcastfeeddict['shortversion'] = appcastfeeddict['version']
 
     return appcastfeeddict
+
+
+def storeAppcastInfo(configpath, appcast):
+    """ store the information for the given Appcast in the appcast repo folder """ 
+    
+    appconfigpath = os.path.join(configpath,appcast['name'])
+    appdmgpath = os.path.join(appconfigpath,"dmgs")
+
+    if not os.path.isdir(appconfigpath):
+        os.mkdir(appconfigpath)
+    else:
+        print >> sys.stderr, \
+            ("the application %s already has been added at %s" % (appcast['name'], appconfigpath))
+        exit(-1)
+
+    if not os.path.isdir(appdmgpath):
+        os.mkdir(appdmgpath)
+
+    # write the feed url into the file
+    feedurlpath = os.path.join(appconfigpath,'url')
+    feedurlfile = open(feedurlpath, 'w')
+    feedurlfile.write(appcast['url'])
+    feedurlfile.close()
+
+    # copy the dsa key, if it exists, into the appconfigpath
+    if not appcast['dsakey'] == '':
+        dsakeydestpath = os.path.join(appconfigpath,'dsakey')
+        shutil.copyfile(appcast['dsakey'], dsakeydestpath)
 
 
 def fetchAppcastFileEnclosure(url):
@@ -86,8 +123,8 @@ def fetchAppcastFileEnclosure(url):
     return filename
 
 
-def checkDSAKey(signature, keypath, filepath):
-    """ checks the DSA key on the downloaded file to verify it's contents """
+def checkDSAsig(signature, keypath, filepath):
+    """ checks the validitity of the downloaded file with the appcast DSA key """
 
     # this is the reverse of how the signature is generated, as specified here:
     # https://github.com/andymatuschak/Sparkle/blob/master/sign_update.rb
@@ -119,11 +156,53 @@ def checkDSAKey(signature, keypath, filepath):
     proc_dgst1.stdout.close()
     verify_out = proc_dgst2.communicate()[0]
 
-    print " DSA signature check: %s" % verify_out
+    print " DSA signature check: %s" % verify_out.rstrip() # strip the newline
 
-    if verify_out == "Verified OK":
+    if verify_out == "Verified OK\n":
         return True
     return False
+
+
+def moveAndConvert(filepath, destpath):
+    """ given the application in one of sparkle's supported formats, save it into a dmg file """
+
+    """ Per the sparkle website, the file can be in a .dmg, .zip, .tar.gz, or .tar.bz 
+        https://github.com/andymatuschak/Sparkle/wiki/publishing-an-update """
+
+    dmgname = os.path.splitext(os.path.basename(destpath))[0]
+    
+    extension = os.path.splitext(filepath)[1]
+
+    if extension == ".dmg":
+        print " download is a .dmg, copying to %s" % destpath
+        shutil.copy(filepath, destpath)
+        return # no conversion necessary
+    else:
+ 
+        # make a temporary directory with the name of the final dmg
+        dmgtempdir = os.path.join(tempfile.mkdtemp(),dmgname)
+        os.mkdir(dmgtempdir)
+        
+        if extension == ".zip":
+            print " download is a .zip, uncompressing"
+            unarchivecmd = ['/usr/bin/unzip',filepath, '-d', dmgtempdir]
+        elif extension == ".tgz" or extension == ".tar.gz":
+            print " download is a .tar.gz, uncompressing"
+            unarchivecmd = ['/usr/bin/tar', '-xzf', filepath, '-C', dmgtempdir, '--strip-components', '1']
+        elif extension == ".tbz" or extension == ".tar.bz" or extension == ".tbz2" or extension == ".tar.bz2":
+            print " download is a .tar.bz2, uncompressing"
+            unarchivecmd = ['/usr/bin/tar', '-xjf', filepath, '-C', dmgtempdir, '--strip-components', '1']
+
+        proc_unarch = subprocess.Popen(unarchivecmd)
+        
+        if proc_unarch.wait():
+            print >> sys.stderr, \
+                    "error in uncompressing download"
+            exit(-1)
+        else:
+            hdiutilcmd =  ['/usr/bin/hdiutil', 'create', '-srcfolder', dmgtempdir, destpath]
+            proc_hdiutil = subprocess.Popen(hdiutilcmd)
+            proc_hdiutil.wait()
 
 
 def main():
@@ -138,27 +217,96 @@ def main():
             action='store', 
             type='string',
             dest='appname',
-            help="""Add the appcast of the application to the repo""")
+            help="""Add the appcast of the application to the configuration directory""")
 
     p.add_option('-u', '--update', 
             action='store_true',
-            help="""Search for updates for all appcasts, if found, download updates""")
+            help="""Search for updates for appcasts""")
+
+    p.add_option('-d', '--download',
+            action='store_true',
+            help="""If updates are found, download them. Requires updates""")
+
+    p.add_option('-m', '--munkiimport',
+            action='store_true',
+            help="""run munkiimport on the downloaded files""")
+
+    p.add_option('-c', '--configdir',
+            action='store',
+            default='~/.munkiappcast',
+            help="""use this configuration directory for storing appcast data - default is ~/.munkiappcast""")
 
     (opts, args) = p.parse_args()
+    
+    configpath = os.path.expanduser(opts.configdir) # do tilde expansion on config dir
+    
+    if not os.path.isdir(configpath):
+        print >> sys.stderr, \
+            ("config dir %s does not exist, or isn't a directory" % configpath)
+        exit(-1)
+
+    if opts.download and not opts.update:
+        print >> sys.stderr, \
+            ("You must update in order to download")
+        opts.print_help()
+        exit(-1)
 
     if opts.appname:
-        
+    
         appcast = getAppcastInfo(opts.appname)
-        print "app: %s -> url: %s" % (opts.appname, appcast['url'])
-        
-        feed = fetchAppcastFeed(appcast['url'])
-        print " version: %s at %s" % (feed['version'], feed['enclosure_url'])
 
-        enclosure = fetchAppcastFileEnclosure(feed['enclosure_url'])
-        print " fetched file: %s" % enclosure
-  
-        if 'enclosure' and feed['dsasig']:
-            dsavalid = checkDSAKey(feed['dsasig'], appcast['keyfile'], enclosure)
+        print "Added app: %s\n Feed url: %s" % (opts.appname, appcast['url'])
+
+        storeAppcastInfo(configpath, appcast)
+
+        exit(0) 
+
+    if opts.update:
+
+        for appinfodir in os.listdir(configpath):
+            print "Updating: %s" % appinfodir
+            appcasturl = open(os.path.join(configpath,appinfodir, 'url')).read()
+
+            feed = fetchAppcastFeed(appcasturl)
+
+            storedversionpath = os.path.join(configpath,appinfodir,'version')
+
+            if os.path.isfile(storedversionpath):
+                storedversion = open(storedversionpath).read()
+            else:
+                storedversion = 0
+
+            if feed['version'] > storedversion:
+                print " new version found: %s, aka %s" % (feed['version'], feed['shortversion'])
+            else:
+                print " version %s is current" % feed['version']
+                continue
+
+            if opts.download:
+
+                print " downloading %s" % feed['enclosure_url']
+                enclosure = fetchAppcastFileEnclosure(feed['enclosure_url'])
+                print " fetched update to temp file: %s" % enclosure
+
+                if 'enclosure' and feed['dsasig']:
+                    dsakey = os.path.join(configpath,appinfodir,'dsakey')
+                    dsavalid = checkDSAsig(feed['dsasig'], dsakey , enclosure)
+                    if not dsavalid:
+                        print ' DSA Signature invalid on downloaded update'
+                        continue
+
+                # build a consistent name for the update
+                updatedmgname = re.sub(r'\s',"_",appinfodir) + "-" + feed['shortversion'] + ".dmg"
+                print " converting and saving to: %s" % updatedmgname
+
+                appdmgpath = os.path.join(configpath,appinfodir,'dmgs',updatedmgname)
+
+                moveAndConvert(enclosure, appdmgpath)
+
+                # update version on disk
+                open(storedversionpath,'w').write(feed['version'])
+
+    exit(0)
 
 
 if __name__ == '__main__':
