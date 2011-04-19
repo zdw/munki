@@ -38,16 +38,25 @@ def getAppcastInfo(path):
                 ("app: '%s' does not appear to be using appcast for updates" % path)
             exit(-1)
         else:
-            appcastdict['name'] = plist['CFBundleName']
             appcastdict['version'] = plist['CFBundleVersion']
-            appcastdict['shortversion'] = plist['CFBundleShortVersionString']
+
+            # if given, use CFBundleName to identify the app, else use appname
+            if 'CFBundleName' in plist:
+                appcastdict['name'] = plist['CFBundleName']
+            else:
+                appcastdict['name'] = os.path.basename(path)
+
+            if 'CFBundleShortVersionString' in plist:
+                appcastdict['shortversion'] = plist['CFBundleShortVersionString']
+            else:
+                appcastdict['shortversion'] = plist['CFBundleVersion']
 
             appcastdict['url'] = plist['SUFeedURL']
             if 'SUPublicDSAKeyFile' in plist:
                 appcastdict['dsakey'] = os.path.join(path, "Contents", "Resources", plist['SUPublicDSAKeyFile'])
             else:   
                 print >> sys.stderr,  \
-                    (" app: '%s' uses appcast but is not DSA signing updates" % apppath);
+                    (" app: '%s' uses appcast but is not DSA signing updates" % path);
                 appcastdict['dsakey'] = ''
 
     return appcastdict
@@ -75,6 +84,8 @@ def fetchAppcastFeed(url):
     
     if enclosure.hasAttribute('sparkle:dsaSignature'):
         appcastfeeddict['dsasig'] = enclosure.getAttribute('sparkle:dsaSignature')
+    else:
+        appcastfeeddict['dsasig'] = False
 
     if enclosure.hasAttribute('sparkle:shortVersionString'):
          appcastfeeddict['shortversion'] = \
@@ -113,12 +124,23 @@ def storeAppcastInfo(configpath, appcast):
         shutil.copyfile(appcast['dsakey'], dsakeydestpath)
 
 
+def urlRetrieveReportHook(transferred, blocksize, totalsize):
+    """ hook called by urlretrieve in fetchAppcastFileEnclosure """
+
+    print "tranferred %d blocks, total size: %d" % (transferred, totalsize)
+    
+
 def fetchAppcastFileEnclosure(url):
     """
     fetches the file specified at the URL, returns a path to the file
     """
 
-    (filename, headers) = urllib.urlretrieve(url)
+    try:
+        filename = urllib.urlretrieve(url, '' , urlRetrieveReportHook)[0]
+    except IOError, e:
+        print >> sys.stderr, \
+                "error retrieving download: %s" % e.code
+        filename = False
 
     return filename
 
@@ -170,28 +192,31 @@ def moveAndConvert(filepath, destpath):
         https://github.com/andymatuschak/Sparkle/wiki/publishing-an-update """
 
     dmgname = os.path.splitext(os.path.basename(destpath))[0]
-    
     extension = os.path.splitext(filepath)[1]
 
     if extension == ".dmg":
-        print " download is a .dmg, copying to %s" % destpath
-        shutil.copy(filepath, destpath)
-        return # no conversion necessary
+        print " download is a .dmg, recompressing to %s" % destpath
+        hdiutilcmd = ['/usr/bin/hdiutil', 'convert', filepath, '-format', 'UDBZ', '-o', destpath]
+        proc_hdiutil = subprocess.Popen(hdiutilcmd)
+        proc_hdiutil.wait()
+        return
     else:
- 
         # make a temporary directory with the name of the final dmg
         dmgtempdir = os.path.join(tempfile.mkdtemp(),dmgname)
         os.mkdir(dmgtempdir)
         
         if extension == ".zip":
-            print " download is a .zip, uncompressing"
+            print " download is a .zip, recompressing to .dmg"
             unarchivecmd = ['/usr/bin/unzip',filepath, '-d', dmgtempdir]
-        elif extension == ".tgz" or extension == ".tar.gz":
-            print " download is a .tar.gz, uncompressing"
+        elif extension == ".tgz" or extension == ".gz":
+            print " download is a .tar.gz, recompressing to .dmg"
             unarchivecmd = ['/usr/bin/tar', '-xzf', filepath, '-C', dmgtempdir, '--strip-components', '1']
-        elif extension == ".tbz" or extension == ".tar.bz" or extension == ".tbz2" or extension == ".tar.bz2":
-            print " download is a .tar.bz2, uncompressing"
+        elif extension == ".tbz" or extension == ".tbz2" or extension == ".bz" or extension == ".bz2":
+            print " download is a .tar.bz2, recompressing to .dmg"
             unarchivecmd = ['/usr/bin/tar', '-xjf', filepath, '-C', dmgtempdir, '--strip-components', '1']
+        else:
+            print " download is in an unknown file format, exiting"
+            exit(-1)
 
         proc_unarch = subprocess.Popen(unarchivecmd)
         
@@ -200,7 +225,7 @@ def moveAndConvert(filepath, destpath):
                     "error in uncompressing download"
             exit(-1)
         else:
-            hdiutilcmd =  ['/usr/bin/hdiutil', 'create', '-srcfolder', dmgtempdir, destpath]
+            hdiutilcmd =  ['/usr/bin/hdiutil', 'create', '-format', 'UDBZ', '-srcfolder', dmgtempdir, destpath]
             proc_hdiutil = subprocess.Popen(hdiutilcmd)
             proc_hdiutil.wait()
 
@@ -247,8 +272,8 @@ def main():
 
     if opts.download and not opts.update:
         print >> sys.stderr, \
-            ("You must update in order to download")
-        opts.print_help()
+            ("You must update in order to download\n")
+        p.print_help()
         exit(-1)
 
     if opts.appname:
@@ -272,7 +297,9 @@ def main():
             storedversionpath = os.path.join(configpath,appinfodir,'version')
 
             if os.path.isfile(storedversionpath):
-                storedversion = open(storedversionpath).read()
+                fd_version = open(storedversionpath, 'r')
+                storedversion = fd_version.read()
+                fd_version.close()
             else:
                 storedversion = 0
 
@@ -284,11 +311,11 @@ def main():
 
             if opts.download:
 
-                print " downloading %s" % feed['enclosure_url']
+                print " downloading update %s" % feed['enclosure_url']
                 enclosure = fetchAppcastFileEnclosure(feed['enclosure_url'])
                 print " fetched update to temp file: %s" % enclosure
 
-                if 'enclosure' and feed['dsasig']:
+                if enclosure and feed['dsasig']:
                     dsakey = os.path.join(configpath,appinfodir,'dsakey')
                     dsavalid = checkDSAsig(feed['dsasig'], dsakey , enclosure)
                     if not dsavalid:
@@ -304,7 +331,9 @@ def main():
                 moveAndConvert(enclosure, appdmgpath)
 
                 # update version on disk
-                open(storedversionpath,'w').write(feed['version'])
+                fd_version = open(storedversionpath,'w')
+                fd_version.write(feed['version'])
+                fd_version.close();
 
     exit(0)
 
