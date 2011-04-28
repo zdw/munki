@@ -4,6 +4,8 @@
 # uses appcast (sparkle) data to build a repository of programs
 # that can be updated automatically
 #
+# Requires an openssl binary to verify signatures on updates. 
+#
 
 import sys
 import os
@@ -316,11 +318,14 @@ def main():
                 print " fetched update to temp file: %s" % enclosure
 
                 if enclosure and feed['dsasig']:
-                    dsakey = os.path.join(configpath,appinfodir,'dsakey')
-                    dsavalid = checkDSAsig(feed['dsasig'], dsakey , enclosure)
-                    if not dsavalid:
-                        print ' DSA Signature invalid on downloaded update'
-                        continue
+                    dsakeypath = os.path.join(configpath,appinfodir,'dsakey')
+                    if os.path.isfile(dsakeypath):
+                        dsavalid = checkDSAsig(feed['dsasig'], dsakeypath , enclosure)
+                        if not dsavalid:
+                            print ' DSA Signature invalid on downloaded update'
+                            continue
+                    else:
+                        print ' DSA Key not found, but signature in appcast'
 
                 # build a consistent name for the update
                 updatedmgname = re.sub(r'\s',"_",appinfodir) + "-" + feed['shortversion'] + ".dmg"
