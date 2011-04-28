@@ -103,6 +103,8 @@ def mountRepoCLI():
     global WE_MOUNTED_THE_REPO
     repo_path = pref('repo_path')
     repo_url = pref('repo_url')
+    if not repo_path or not repo_url:
+        return
     if os.path.exists(repo_path):
         return
     os.mkdir(repo_path)
