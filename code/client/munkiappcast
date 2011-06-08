@@ -129,7 +129,8 @@ def storeAppcastInfo(configpath, appcast):
 def urlRetrieveReportHook(transferred, blocksize, totalsize):
     """ hook called by urlretrieve in fetchAppcastFileEnclosure """
 
-    print "tranferred %d blocks, total size: %d" % (transferred, totalsize)
+    print '.',
+    #print "tranferred %d blocks, total size: %d" % (transferred, totalsize)
     
 
 def fetchAppcastFileEnclosure(url):
@@ -139,6 +140,7 @@ def fetchAppcastFileEnclosure(url):
 
     try:
         filename = urllib.urlretrieve(url, '' , urlRetrieveReportHook)[0]
+        print " done!"
     except IOError, e:
         print >> sys.stderr, \
                 "error retrieving download: %s" % e.code
@@ -209,7 +211,7 @@ def moveAndConvert(filepath, destpath):
         
         if extension == ".zip":
             print " download is a .zip, recompressing to .dmg"
-            unarchivecmd = ['/usr/bin/unzip',filepath, '-d', dmgtempdir]
+            unarchivecmd = ['/usr/bin/unzip','-q',filepath, '-d', dmgtempdir]
         elif extension == ".tgz" or extension == ".gz":
             print " download is a .tar.gz, recompressing to .dmg"
             unarchivecmd = ['/usr/bin/tar', '-xzf', filepath, '-C', dmgtempdir, '--strip-components', '1']
@@ -278,6 +280,12 @@ def main():
         p.print_help()
         exit(-1)
 
+    if opts.munkiimport and not opts.download:
+        print >> sys.stderr, \
+            ("You must update and download in order to run munkiimport\n")
+        p.print_help()
+        exit(-1)
+
     if opts.appname:
     
         appcast = getAppcastInfo(opts.appname)
@@ -339,6 +347,13 @@ def main():
                 fd_version = open(storedversionpath,'w')
                 fd_version.write(feed['version'])
                 fd_version.close();
+
+                if opts.munkiimport: 
+                    print " running munkiimport in noninteractive mode"
+                    munkiimportcmd = ["./munkiimport", "-n", appdmgpath]
+
+                    proc_munkiimport  = subprocess.Popen(munkiimportcmd)
+                    proc_munkiimport.wait()
 
     exit(0)
 
