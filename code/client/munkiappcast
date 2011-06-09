@@ -319,22 +319,27 @@ def main():
                 print " version %s is current" % feed['version']
                 continue
 
+            dsakeypath = os.path.join(configpath,appinfodir,'dsakey')
+            dsakey_exists = os.path.isfile(dsakeypath)
+
+            if dsakey_exists and not feed['dsasig']:
+                print ' DSA key is available, but no update signature in feed. Aborting, as this update is not likely valid'
+                continue
+            if not dsakey_exists and feed['dsasig']:
+                print ' DSA Key not found, but signature in appcast - try looking for key in app bundle.'
+
             if opts.download:
 
                 print " downloading update %s" % feed['enclosure_url']
                 enclosure = fetchAppcastFileEnclosure(feed['enclosure_url'])
                 print " fetched update to temp file: %s" % enclosure
-
-                if enclosure and feed['dsasig']:
-                    dsakeypath = os.path.join(configpath,appinfodir,'dsakey')
-                    if os.path.isfile(dsakeypath):
-                        dsavalid = checkDSAsig(feed['dsasig'], dsakeypath , enclosure)
-                        if not dsavalid:
-                            print ' DSA Signature invalid on downloaded update'
-                            continue
-                    else:
-                        print ' DSA Key not found, but signature in appcast'
-
+                    
+                if enclosure and dsakey_exists and feed['dsasig']:
+                    dsavalid = checkDSAsig(feed['dsasig'], dsakeypath , enclosure)
+                    if not dsavalid:
+                        print ' DSA Signature invalid on downloaded update!'
+                        continue
+ 
                 # build a consistent name for the update
                 updatedmgname = re.sub(r'\s',"_",appinfodir) + "-" + feed['shortversion'] + ".dmg"
                 print " converting and saving to: %s" % updatedmgname
