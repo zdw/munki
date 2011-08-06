@@ -93,12 +93,13 @@ def set_file_nonblock(f, non_blocking=True):
     """
     flags = fcntl.fcntl(f.fileno(), fcntl.F_GETFL)
     if bool(flags & os.O_NONBLOCK) != non_blocking:
-      flags ^= os.O_NONBLOCK
+        flags ^= os.O_NONBLOCK
     fcntl.fcntl(f.fileno(), fcntl.F_SETFL, flags)
 
 
 class Popen(subprocess.Popen):
-
+    '''Subclass of subprocess.Popen to add support for
+    timeouts for some operations.'''
     def timed_readline(self, f, timeout):
         """Perform readline-like operation with timeout.
 
@@ -113,7 +114,8 @@ class Popen(subprocess.Popen):
         output = []
         inactive = 0
         while 1:
-            (rlist, wlist, xlist) = select.select([f], [], [], 1.0)
+            (rlist, unused_wlist, unused_xlist) = select.select(
+                [f], [], [], 1.0)
 
             if not rlist:
                 inactive += 1  # approx -- py select doesn't return tv
@@ -133,11 +135,11 @@ class Popen(subprocess.Popen):
         else:
             return ''.join(output)
 
-    def communicate(self, input=None, timeout=0):
+    def communicate(self, std_in=None, timeout=0):
         """Communicate, optionally ending after a timeout of no activity.
 
         Args:
-            input: str, to send on stdin
+            std_in: str, to send on stdin
             timeout: int, seconds of inactivity to raise error at
         Returns:
             (str or None, str or None) for stdout, stderr
@@ -145,7 +147,7 @@ class Popen(subprocess.Popen):
             TimeoutError, if timeout is reached
         """
         if timeout <= 0:
-            return super(Popen, self).communicate(input=input)
+            return super(Popen, self).communicate(input=std_in)
 
         fds = []
         stdout = []
@@ -163,7 +165,8 @@ class Popen(subprocess.Popen):
         returncode = None
 
         while returncode is None:
-            (rlist, wlist, xlist) = select.select(fds, [], [], 1.0)
+            (rlist, unused_wlist, unused_xlist) = select.select(
+                fds, [], [], 1.0)
 
             if not rlist:
                 inactive += 1
@@ -286,7 +289,7 @@ def concat_log_message(msg, *args):
         args = [str_to_ascii(arg) for arg in args]
         try:
             msg = msg % tuple(args)
-        except TypeError, e:
+        except TypeError, err:
             warnings.warn(
                 'String format does not match concat args: %s' % (
                 str(sys.exc_info())))
@@ -830,7 +833,7 @@ def pref(pref_name):
         # /Library/Preferences/<BUNDLE_ID>.plist for admin
         # discoverability
         set_pref(pref_name, pref_value)
-    if type(pref_value).__name__ in ['__NSCFDate', '__NSDate', '__CFDate']:
+    if isinstance(pref_value, NSDate):
         # convert NSDate/CFDates to strings
         pref_value = str(pref_value)
     return pref_value
@@ -1141,7 +1144,7 @@ def getOnePackageInfo(pkgpath):
         #if bomlist:
         #    pkginfo['apps'] = [os.path.basename(item) for item in bomlist
         #                        if item.endswith('.app')]
-                
+
     else:
         # look for old-style .info files!
         infopath = os.path.join(pkgpath, 'Contents', 'Resources',
@@ -1368,7 +1371,7 @@ def nameAndVersion(aString):
         version = aString[index:]
         return (aString[0:index].rstrip(' .-_v'), version)
     else:
-        # no version number found, 
+        # no version number found,
         # just return original string and empty string
         return (aString, '')
 
@@ -1853,24 +1856,23 @@ def listdir(path):
     return os.listdir(path)
 
 
-def findProcesses(user=None, exe=None, args=None):
+def findProcesses(user=None, exe=None):
     """Find processes in process list.
 
     Args:
         user: str, optional, username owning process
         exe: str, optional, executable name of process
-        args: str, optional, string arguments to match to process
     Returns:
         dictionary of pids = {
                 pid: {
                         'user': str, username owning process,
-                        'args': str, string executable and arguments of process,
+                        'exe': str, string executable of process,
                 }
         }
 
         list of pids, or {} if none
     """
-    argv = ['/bin/ps', '-x', '-w', '-w', '-a', '-o', 'pid=,user=,args=']
+    argv = ['/bin/ps', '-x', '-w', '-w', '-a', '-o', 'pid=,user=,comm=']
 
     p = subprocess.Popen(
         argv,
@@ -1886,26 +1888,24 @@ def findProcesses(user=None, exe=None, args=None):
         lines = stdout.splitlines()
 
         for proc in lines:
-            (p_pid, p_user, p_args) = proc.split(None, 2)
+            (p_pid, p_user, p_comm) = proc.split(None, 2)
 
             if exe is not None:
-                if not p_args.startswith(exe):
-                    continue
-            if args is not None:
-                if not p_args.find(args) > -1:
+                if not p_comm.startswith(exe):
                     continue
             if user is not None:
                 if p_user != user:
                     continue
             pids[int(p_pid)] = {
                     'user': p_user,
-                    'args': p_args,
+                    'exe': p_comm,
             }
 
     except (ValueError, TypeError, IndexError):
         return pids
 
     return pids
+
 
 
 def forceLogoutNow():
